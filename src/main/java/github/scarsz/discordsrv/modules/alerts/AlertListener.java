@@ -32,13 +32,12 @@ import github.scarsz.discordsrv.util.*;
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.TextChannel;
 import net.dv8tion.jda.api.events.GenericEvent;
+import net.dv8tion.jda.api.events.interaction.ButtonClickEvent;
 import net.dv8tion.jda.api.hooks.EventListener;
 import net.dv8tion.jda.api.interactions.components.ActionRow;
 import net.dv8tion.jda.api.interactions.components.Button;
 import net.dv8tion.jda.api.interactions.components.ButtonStyle;
-import net.dv8tion.jda.api.events.interaction.ButtonClickEvent;
 import org.apache.commons.lang3.StringUtils;
-import org.bukkit.event.server.PluginDisableEvent;
 import org.apache.commons.lang3.math.NumberUtils;
 import org.bukkit.Bukkit;
 import org.bukkit.command.CommandSender;
@@ -46,6 +45,8 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.*;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
 import org.bukkit.event.player.PlayerEvent;
+import org.bukkit.event.server.PluginEnableEvent;
+import org.bukkit.event.server.PluginDisableEvent;
 import org.bukkit.event.server.ServerCommandEvent;
 import org.bukkit.plugin.RegisteredListener;
 import org.jetbrains.annotations.NotNull;
@@ -66,19 +67,27 @@ import java.util.stream.Collectors;
 
 public class AlertListener implements Listener, EventListener {
 
+    private static final String BUTTON_ID_PREFIX = "dsrv-alert:";
+    private static final int BUTTONS_PER_ROW = 5;
+    private static final int MAX_ROWS = 5;
+    private static final int MAX_BUTTONS_TOTAL = BUTTONS_PER_ROW * MAX_ROWS;
+    private static final long BUTTON_EXPIRY_MINUTES = 10;
+
     private static class ButtonAction {
         final String runAs; // "console" or "player"
-        final String playerName; // when runAs=player, may be null
+        final UUID playerUuid; // when runAs=player, may be null
+        final boolean fallbackToConsole;
         final List<String> commands;
-        ButtonAction(String runAs, String playerName, List<String> commands) {
+        ButtonAction(String runAs, UUID playerUuid, boolean fallbackToConsole, List<String> commands) {
             this.runAs = runAs;
-            this.playerName = playerName;
+            this.playerUuid = playerUuid;
+            this.fallbackToConsole = fallbackToConsole;
             this.commands = commands;
         }
     }
 
-    private final Map<String, ButtonAction> buttonCommandMap = new ExpiringDualHashBidiMap<>(TimeUnit.MINUTES.toMillis(10));
-    private final java.util.Set<PendingDisable> pendingDisables = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Map<String, ButtonAction> buttonCommandMap = new ExpiringDualHashBidiMap<>(TimeUnit.MINUTES.toMillis(BUTTON_EXPIRY_MINUTES));
+    private final Set<PendingDisable> pendingDisables = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private static class PendingDisable {
         final long channelId;
@@ -171,14 +180,40 @@ public class AlertListener implements Listener, EventListener {
             }
 
             // set the HandlerList.allLists field to be a proxy list that adds our listener to all initializing lists
+            allListsField.set(null, new ArrayList<HandlerList>() {
+                {
+                    // add any already existing handler lists to our new proxy list
+                    synchronized (this) {
+                        this.addAll(HandlerList.getHandlerLists());
+                    }
+                }
+
+                @Override
+                public boolean addAll(Collection<? extends HandlerList> c) {
+                    boolean changed = false;
+                    for (HandlerList handlerList : c) {
+                        if (add(handlerList)) changed = true;
+                    }
+                    return changed;
+                }
+
+                @Override
+                public boolean add(HandlerList list) {
+                    boolean added = super.add(list);
+                    addListener(list);
+                    return added;
+                }
+            });
+        } catch (NoSuchFieldException | IllegalAccessException e) {
+            // Proxy install failed (likely Java 12+ blocking modifiersField reflection).
+            // Fall back to a one-shot scan; PluginEnableEvent re-scans cover plugins loaded later.
+            DiscordSRV.debug(Debug.ALERTS, "HandlerList proxy unavailable, falling back to scan-on-plugin-enable: " + e);
             List<HandlerList> existing = HandlerList.getHandlerLists();
             synchronized (existing) {
                 for (HandlerList list : existing) {
                     addListener(list);
                 }
             }
-        } catch (Throwable e) {
-            DiscordSRV.error(e);
         }
     }
 
@@ -305,76 +340,86 @@ public class AlertListener implements Listener, EventListener {
 
     @Override
     public void onEvent(@NotNull GenericEvent event) {
-        // Handle button interactions for command buttons
-        if (event instanceof ButtonClickEvent) {
-            ButtonClickEvent btnEvent = (ButtonClickEvent) event;
-            String id = btnEvent.getComponentId();
-            ButtonAction action = buttonCommandMap.get(id);
-            if (action != null) {
-                try {
-                    // Acknowledge the click to avoid "This interaction failed"
-                    btnEvent.reply("Command queued.").setEphemeral(true).queue();
-                } catch (Throwable ignored) {}
-
-                // Disable the clicked button immediately on the message (non-webhook path only has message objects we can edit)
-                try {
-                    List<ActionRow> current = btnEvent.getMessage().getActionRows();
-                    List<ActionRow> updated = new ArrayList<>(current.size());
-                    boolean changed = false;
-                    for (ActionRow row : current) {
-                        List<Button> newButtons = new ArrayList<>(row.getButtons().size());
-                        for (Button b : row.getButtons()) {
-                            if (id.equals(b.getId())) {
-                                newButtons.add(b.withDisabled(true));
-                                changed = true;
-                            } else {
-                                newButtons.add(b);
-                            }
-                        }
-                        updated.add(ActionRow.of(newButtons));
-                    }
-                    if (changed) {
-                        // Try edit via event helper if available; fallback to editing the message
-                        try {
-                            btnEvent.getMessage().editMessageComponents(updated).queue(s -> {}, e -> {});
-                        } catch (Throwable ignored2) {}
-                    }
-                } catch (Throwable t) {
-                    DiscordSRV.debug(Debug.ALERTS, "Failed to disable clicked button immediately: " + t.getMessage());
-                }
-
-                // Remove mapping to prevent any reuse
-                buttonCommandMap.remove(id);
-
-                // Execute commands according to action context on the main thread
-                SchedulerUtil.runTask(DiscordSRV.getPlugin(), () -> {
-                    try {
-                        if ("player".equalsIgnoreCase(action.runAs)) {
-                            Player p = action.playerName != null ? Bukkit.getPlayerExact(action.playerName) : null;
-                            for (String c : action.commands) {
-                                boolean ok;
-                                if (p != null && p.isOnline()) {
-                                    ok = Bukkit.dispatchCommand(p, c);
-                                    if (!ok) DiscordSRV.warning("Player command from button failed to dispatch: " + c);
-                                } else {
-                                    ok = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), c);
-                                    if (!ok) DiscordSRV.warning("Fallback console command from button failed to dispatch: " + c);
-                                }
-                            }
-                        } else {
-                            for (String c : action.commands) {
-                                boolean ok = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), c);
-                                if (!ok) DiscordSRV.warning("Command from button failed to dispatch: " + c);
-                            }
-                        }
-                    } catch (Throwable t) {
-                        DiscordSRV.error("Error running button commands: " + t.getMessage());
-                    }
-                });
-                return; // handled
-            }
+        if (event instanceof ButtonClickEvent && handleButtonClick((ButtonClickEvent) event)) {
+            return;
         }
         runAlertsForEvent(event);
+    }
+
+    /** @return true if the event was one of our alert buttons and we handled it. */
+    private boolean handleButtonClick(ButtonClickEvent btnEvent) {
+        String id = btnEvent.getComponentId();
+        if (id == null || !id.startsWith(BUTTON_ID_PREFIX)) return false;
+
+        // Atomic claim — prevents double-execution from rapid double clicks
+        ButtonAction action = buttonCommandMap.remove(id);
+        if (action == null) {
+            // Mapping expired (10min) or lost across restart. Tell the user instead of silently doing nothing.
+            try {
+                btnEvent.reply("This button has expired.").setEphemeral(true).queue();
+            } catch (Exception ignored) {}
+            return true;
+        }
+
+        try {
+            btnEvent.reply("Command queued.").setEphemeral(true).queue();
+        } catch (Exception ignored) {}
+
+        // Disable just the clicked button on the message
+        try {
+            List<ActionRow> current = btnEvent.getMessage().getActionRows();
+            List<ActionRow> updated = new ArrayList<>(current.size());
+            boolean changed = false;
+            for (ActionRow row : current) {
+                List<Button> newButtons = new ArrayList<>(row.getButtons().size());
+                for (Button b : row.getButtons()) {
+                    if (id.equals(b.getId())) {
+                        newButtons.add(b.withDisabled(true));
+                        changed = true;
+                    } else {
+                        newButtons.add(b);
+                    }
+                }
+                updated.add(ActionRow.of(newButtons));
+            }
+            if (changed) {
+                btnEvent.getMessage().editMessageComponents(updated).queue(s -> {}, e -> {});
+            }
+        } catch (Exception t) {
+            DiscordSRV.debug(Debug.ALERTS, "Failed to disable clicked button immediately: " + t.getMessage());
+        }
+
+        SchedulerUtil.runTask(DiscordSRV.getPlugin(), () -> {
+            try {
+                if ("player".equalsIgnoreCase(action.runAs)) {
+                    Player p = action.playerUuid != null ? Bukkit.getPlayer(action.playerUuid) : null;
+                    if (p != null && p.isOnline()) {
+                        for (String c : action.commands) {
+                            if (!Bukkit.dispatchCommand(p, c)) {
+                                DiscordSRV.warning("Player command from button failed to dispatch: " + c);
+                            }
+                        }
+                    } else if (action.fallbackToConsole) {
+                        for (String c : action.commands) {
+                            if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), c)) {
+                                DiscordSRV.warning("Fallback console command from button failed to dispatch: " + c);
+                            }
+                        }
+                    } else {
+                        DiscordSRV.warning("Skipping button commands: target player is offline and FallbackToConsole is not enabled");
+                    }
+                } else {
+                    for (String c : action.commands) {
+                        if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), c)) {
+                            DiscordSRV.warning("Command from button failed to dispatch: " + c);
+                        }
+                    }
+                }
+            } catch (Exception t) {
+                DiscordSRV.error("Error running button commands: " + t.getMessage());
+            }
+        });
+        return true;
     }
 
     @Subscribe
@@ -393,11 +438,22 @@ public class AlertListener implements Listener, EventListener {
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
+    public void onPluginEnable(PluginEnableEvent event) {
+        // Catches HandlerLists created by plugins loaded after the proxy was installed
+        // (and also covers the case where the proxy install failed entirely).
+        List<HandlerList> lists = HandlerList.getHandlerLists();
+        synchronized (lists) {
+            for (HandlerList list : lists) {
+                addListener(list);
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
     public void onPluginDisable(PluginDisableEvent event) {
         try {
             if (event.getPlugin() != DiscordSRV.getPlugin()) return;
             if (pendingDisables.isEmpty()) return;
-            // Copy to avoid concurrent modification if callbacks remove entries
             List<PendingDisable> copy = new ArrayList<>(pendingDisables);
             for (PendingDisable pd : copy) {
                 try {
@@ -409,15 +465,15 @@ public class AlertListener implements Listener, EventListener {
                     ch.retrieveMessageById(pd.messageId).queue(msg -> {
                         try {
                             msg.editMessageComponents(pd.disabledRows).queue(s -> pendingDisables.remove(pd), e -> pendingDisables.remove(pd));
-                        } catch (Throwable ignored) {
+                        } catch (Exception ignored) {
                             pendingDisables.remove(pd);
                         }
                     }, err -> pendingDisables.remove(pd));
-                } catch (Throwable ignored) {
+                } catch (Exception ignored) {
                     pendingDisables.remove(pd);
                 }
             }
-        } catch (Throwable t) {
+        } catch (Exception t) {
             DiscordSRV.debug(Debug.ALERTS, "Plugin disable button cleanup failed: " + t.getMessage());
         }
     }
@@ -730,17 +786,22 @@ public class AlertListener implements Listener, EventListener {
                     while (it.hasNext()) {
                         Dynamic btn = it.next();
                         try {
+                            if (!btn.get("Text").isPresent()) {
+                                DiscordSRV.warning("Alert at index " + alertIndex + " has a button with no 'Text' — skipping");
+                                continue;
+                            }
                             String label = translator.apply(btn.dget("Text").asString(), false);
                             String url = btn.get("Url").isPresent() ? translator.apply(btn.dget("Url").asString(), true) : null;
                             String styleStr = btn.get("Style").isPresent() ? btn.dget("Style").asString() : null;
                             String runAs = btn.get("RunAs").isPresent() ? btn.dget("RunAs").asString() : "console";
+                            boolean fallbackToConsole = btn.get("FallbackToConsole").isPresent()
+                                    && Boolean.parseBoolean(btn.dget("FallbackToConsole").convert().intoString());
 
                             if (StringUtils.isBlank(label)) continue;
 
                             if (StringUtils.isNotBlank(url)) {
                                 // URL provided: must be a link button; style ignored/forced to LINK
-                                Button button = Button.link(url, label);
-                                builtButtons.add(button);
+                                builtButtons.add(Button.link(url, label));
                                 continue;
                             }
 
@@ -761,7 +822,7 @@ public class AlertListener implements Listener, EventListener {
 
                             // Command/custom-id button must have at least one command
                             if (commandsList.isEmpty()) {
-                                DiscordSRV.debug(Debug.ALERTS, "Skipping button with no Url/Command(s) in alert index " + alertIndex);
+                                DiscordSRV.warning("Alert at index " + alertIndex + " has a button with neither 'Url' nor 'Command'/'Commands' — skipping");
                                 continue;
                             }
 
@@ -779,23 +840,20 @@ public class AlertListener implements Listener, EventListener {
                                 }
                             }
 
-                            // Create a custom id and store mapping to ButtonAction (+context for runAs)
-                            String customId = UUID.randomUUID().toString();
-                            String playerName = ("player".equalsIgnoreCase(runAs) && finalPlayer != null) ? finalPlayer.getName() : null;
-                            buttonCommandMap.put(customId, new ButtonAction(runAs, playerName, commandsList));
+                            String customId = BUTTON_ID_PREFIX + UUID.randomUUID();
+                            UUID playerUuid = ("player".equalsIgnoreCase(runAs) && finalPlayer != null) ? finalPlayer.getUniqueId() : null;
+                            buttonCommandMap.put(customId, new ButtonAction(runAs, playerUuid, fallbackToConsole, commandsList));
 
-                            Button button = Button.of(style, customId, label);
-                            builtButtons.add(button);
-                        } catch (Throwable t) {
+                            builtButtons.add(Button.of(style, customId, label));
+                        } catch (Exception t) {
                             DiscordSRV.debug(Debug.ALERTS, "Skipping invalid button in alert index " + alertIndex + ": " + t.getMessage());
                         }
                     }
-                    // Discord allows 5 rows max, 5 buttons per row; cap at 25
-                    int limit = Math.min(25, builtButtons.size());
-                    for (int i = 0; i < limit; i += 5) {
-                        List<Button> slice = builtButtons.subList(i, Math.min(i + 5, limit));
+                    int limit = Math.min(MAX_BUTTONS_TOTAL, builtButtons.size());
+                    for (int i = 0; i < limit; i += BUTTONS_PER_ROW) {
+                        List<Button> slice = builtButtons.subList(i, Math.min(i + BUTTONS_PER_ROW, limit));
                         if (!slice.isEmpty()) actionRows.add(ActionRow.of(slice));
-                        if (actionRows.size() >= 5) break;
+                        if (actionRows.size() >= MAX_ROWS) break;
                     }
                 }
 
@@ -826,17 +884,15 @@ public class AlertListener implements Listener, EventListener {
 
                             textChannel.sendMessage(message).setActionRows(actionRows).queue(sent -> {
                                 try {
-                                    // Track this message for potential shutdown-time disable
                                     PendingDisable pd = new PendingDisable(sent.getChannel().getIdLong(), sent.getIdLong(), disabledRows);
                                     pendingDisables.add(pd);
 
-                                    // Disable buttons after 10 minutes to reflect interaction expiry
-                                    sent.editMessageComponents(disabledRows).queueAfter(10, TimeUnit.MINUTES, s -> {
+                                    sent.editMessageComponents(disabledRows).queueAfter(BUTTON_EXPIRY_MINUTES, TimeUnit.MINUTES, s -> {
                                         pendingDisables.remove(pd);
                                     }, err -> {
                                         pendingDisables.remove(pd);
                                     });
-                                } catch (Throwable ignored) {}
+                                } catch (Exception ignored) {}
                             }, err -> {
                                 // fallback without buttons on failure
                                 DiscordSRV.error("Failed to send alert with buttons: " + err.getMessage());
